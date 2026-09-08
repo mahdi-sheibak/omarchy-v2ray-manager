@@ -107,9 +107,23 @@ Item {
   }
 
   Component.onCompleted: {
-    // Check for the CLI; if missing, self-install from the plugin folder.
-    whichProcess.command = ["which", "omarchy-v2ray"]
-    whichProcess.running = true
+    // Absolute-path check first — `which` depends on omarchy-shell's service
+    // PATH, which does not always include ~/.local/bin on every machine.
+    checkProcess.command = ["bash", "-c", "test -x \"$HOME/.local/bin/omarchy-v2ray\" && echo \"$HOME/.local/bin/omarchy-v2ray\" || exit 1"]
+    checkProcess.running = true
+  }
+
+  // ── CLI detection: absolute-path test, falls back to `which` ──────────
+  // Emits the resolved CLI path on stdout; empty output = not found.
+  function applyCheckResult(text) {
+    var p = String(text || "").trim().split("\n")[0]
+    if (p !== "") {
+      root.cliPath = p
+      root.installed = true
+      root.refresh()
+      return true
+    }
+    return false
   }
 
   // ── Self-install: when the CLI is missing, run scripts/install.sh once ──
@@ -124,21 +138,36 @@ Item {
   }
 
   Process {
+    id: checkProcess
+    running: false
+    command: []
+    stdout: StdioCollector { id: checkStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      // Try the PATH fallback if the absolute path check failed.
+      if (!root.applyCheckResult(checkStdout.text)) {
+        whichProcess.command = ["which", "omarchy-v2ray"]
+        whichProcess.running = true
+      }
+    }
+  }
+
+  Process {
     id: installerProcess
     running: false
     command: []
     stdout: StdioCollector { waitForEnd: true }
     stderr: StdioCollector { id: installStderr; waitForEnd: true }
     onExited: function(exitCode) {
-      if (exitCode === 0) {
-        // Re-detect the CLI now that install.sh placed it.
-        whichProcess.command = ["which", "omarchy-v2ray"]
-        whichProcess.running = true
-      } else {
+      // ALWAYS re-detect: the CLI may already be in place even when the
+      // installer exited non-zero (e.g. optional TUN-unit step failed
+      // under set -e after the CLI copy succeeded).
+      if (exitCode !== 0) {
         actionStatus = ""
-        lastError = "Auto-install failed (exit " + exitCode + "): "
+        root.lastError = "Installer exit " + exitCode + " — CLI may still be usable. "
           + String(installStderr.text || "").replace(/\x1b\[[0-9;]*m/g, "").trim()
       }
+      whichProcess.command = ["which", "omarchy-v2ray"]
+      whichProcess.running = true
     }
   }
 

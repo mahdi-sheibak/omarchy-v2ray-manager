@@ -41,6 +41,11 @@ systemctl --user daemon-reload
 
 # System-level units (TUN mode) need root + polkit.
 # TUN units reference the user's config path; rewrite /home/mahdi → $HOME.
+# BEST-EFFORT: if root install fails here (no TTY for pkexec/sudo when
+# spawned from Quickshell), we continue — the CLI falls back to
+# `pkexec systemctl start` at first TUN connect, which shows a GUI prompt
+# at the right moment. Blocking the whole installer on this breaks
+# auto-install on fresh machines (CLI already copied by then).
 have_pkexec() { command -v pkexec >/dev/null 2>&1; }
 
 units_needed=0
@@ -55,18 +60,18 @@ if [ "$units_needed" = "1" ]; then
         tmp="/tmp/$unit.$$"
         sed "s|/home/mahdi|$HOME|g" "$src" > "$tmp"
         if have_pkexec; then
-            pkexec cp "$tmp" "/etc/systemd/system/$unit"
+            pkexec cp "$tmp" "/etc/systemd/system/$unit" || echo "warn: could not install $unit (will prompt at first TUN connect)"
         else
-            sudo cp "$tmp" "/etc/systemd/system/$unit"
+            sudo -n cp "$tmp" "/etc/systemd/system/$unit" 2>/dev/null || echo "warn: could not install $unit (will prompt at first TUN connect)"
         fi
         rm -f "$tmp"
     done
     if have_pkexec; then
-        pkexec systemctl daemon-reload
+        pkexec systemctl daemon-reload || sudo -n systemctl daemon-reload 2>/dev/null || true
     else
-        sudo systemctl daemon-reload
+        sudo -n systemctl daemon-reload 2>/dev/null || true
     fi
-    echo "TUN units installed."
+    echo "TUN units installed (best-effort)."
 fi
 
 echo "omarchy-v2ray-manager installed."
