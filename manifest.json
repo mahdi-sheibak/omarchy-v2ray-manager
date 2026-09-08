@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "id": "mahdi.v2ray-manager",
+  "name": "V2Ray",
+  "version": "1.1.0",
+  "author": "mahdi",
+  "license": "MIT",
+  "description": "VLESS/VMESS connection manager with selectable sing-box or xray-core backend: toggle proxy or full TUN VPN, switch profiles, and import share links from the Omarchy bar.",
+  "kinds": [
+    "bar-widget",
+    "panel",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "V2Ray",
+    "description": "Toggle V2Ray connections, switch backend (sing-box/xray-core), switch between Proxy and TUN modes, manage profiles, and import share links.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 30,
+      "subscriptionRefetchMin": 360,
+      "autoReconnect": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Status refresh interval (s)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 30
+      },
+      {
+        "key": "subscriptionRefetchMin",
+        "type": "integer",
+        "label": "Auto-refetch subscriptions (min, 0=off)",
+        "min": 0,
+        "max": 1440,
+        "step": 60,
+        "defaultValue": 360
+      },
+      {
+        "key": "autoReconnect",
+        "type": "boolean",
+        "label": "Auto-reconnect on health-check failure"
+      }
+    ]
+  }
+}
