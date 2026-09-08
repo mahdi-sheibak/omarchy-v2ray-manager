@@ -1,0 +1,12 @@
+[Unit]
+Description=Omarchy V2Ray manager (sing-box proxy mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/sing-box run -c %h/.config/v2ray-manager/config-proxy.json
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

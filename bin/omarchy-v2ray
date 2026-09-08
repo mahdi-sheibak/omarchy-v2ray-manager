@@ -1,0 +1,1932 @@
+#!/usr/bin/env python3
+import base64
+import hashlib
+import json
+import shlex
+import os
+import socket
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse, parse_qs, unquote, quote
+import urllib.request
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(HOME, ".config", "v2ray-manager")
+PROFILES_PATH = os.path.join(CONFIG_DIR, "profiles.json")
+STATE_PATH = os.path.join(CONFIG_DIR, "state.json")
+PROXY_CONFIG = os.path.join(CONFIG_DIR, "config-proxy.json")
+TUN_CONFIG = os.path.join(CONFIG_DIR, "config-tun.json")
+XRAY_CONFIG = os.path.join(CONFIG_DIR, "config-xray.json")
+XRAY_TUN_CONFIG = os.path.join(CONFIG_DIR, "config-xray-tun.json")
+USER_SERVICE = "omarchy-v2ray.service"
+XRAY_SERVICE = "omarchy-v2ray-xray.service"
+TUN_SERVICE = "omarchy-v2ray-tun.service"
+XRAY_TUN_SERVICE = "omarchy-v2ray-xray-tun.service"
+MIXED_PORT = 2080
+PING_PORT_BASE = 2081
+HISTORY_MAX = 10      # sparkline: last N latency samples per profile
+GEO_CACHE_SEC = 300   # geo lookup freshness (5 min)
+
+
+def die(msg, code=1):
+    print(json.dumps({"ok": False, "error": msg}))
+    sys.exit(code)
+
+
+def ensure_dirs():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+
+def load_store():
+    ensure_dirs()
+    if not os.path.exists(PROFILES_PATH):
+        return {"profiles": [], "selected": None, "mode": "proxy"}
+    try:
+        with open(PROFILES_PATH) as f:
+            store = json.load(f)
+    except Exception:
+        return {"profiles": [], "selected": None, "mode": "proxy"}
+    store.setdefault("profiles", [])
+    store.setdefault("selected", None)
+    store.setdefault("mode", "proxy")
+    store.setdefault("groups", [])   # persistent named groups (may be empty)
+    return store
+
+
+def save_store(store):
+    ensure_dirs()
+    tmp = PROFILES_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(store, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, PROFILES_PATH)
+
+
+def b64pad(s):
+    s = s.strip().replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return s
+
+
+def q(params, key, default=""):
+    vals = params.get(key)
+    if not vals:
+        return default
+    return str(vals[0]).strip()
+
+
+def truthy(v):
+    return str(v).lower() in ("1", "true", "yes")
+
+
+def fingerprint_of(raw):
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def parse_vless(url):
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    if parsed.scheme != "vless":
+        return None
+    params = parse_qs(parsed.query)
+    uuid = unquote(parsed.username or "")
+    host = parsed.hostname or ""
+    port = parsed.port or 443
+    name = unquote(parsed.fragment or "").strip() or f"{host}:{port}"
+    if not uuid or not host:
+        return None
+
+    profile = {
+        "proto": "vless",
+        "name": name,
+        "server": host,
+        "server_port": int(port),
+        "uuid": uuid,
+        "flow": q(params, "flow"),
+        "packet_encoding": "xudp",
+    }
+
+    security = q(params, "security").lower()
+    sni = q(params, "sni") or q(params, "host")
+    if security in ("tls", "reality"):
+        tls = {"enabled": True}
+        if sni:
+            tls["server_name"] = sni
+        if truthy(q(params, "allowinsecure")) or truthy(q(params, "insecure")):
+            tls["insecure"] = True
+        alpn = q(params, "alpn")
+        if alpn:
+            tls["alpn"] = [a for a in alpn.split(",") if a]
+        fp = q(params, "fp")
+        if fp:
+            tls["utls"] = {"enabled": True, "fingerprint": fp}
+        if security == "reality":
+            pbk = q(params, "pbk")
+            sid = q(params, "sid")
+            if not pbk:
+                return None
+            reality = {"enabled": True, "public_key": pbk}
+            if sid:
+                reality["short_id"] = sid
+            tls["reality"] = reality
+            if not tls.get("utls"):
+                tls["utls"] = {"enabled": True, "fingerprint": "chrome"}
+        profile["tls"] = tls
+
+    transport = build_transport(
+        q(params, "type").lower() or "tcp",
+        q(params, "path"),
+        q(params, "host"),
+        q(params, "servicename"),
+        q(params, "ed"),
+        params,
+    )
+    if transport:
+        profile["transport"] = transport
+    return profile
+
+
+def build_transport(net, path, host, service_name, ed, params):
+    net_aliases = {"h2": "http", "http2": "http"}
+    net = net_aliases.get(net, net)
+    if net in ("tcp", "", "none", "raw"):
+        return None
+    if net == "ws":
+        t = {"type": "ws"}
+        if path:
+            t["path"] = path
+        headers = {}
+        if host:
+            headers["Host"] = host.split(",")[0].strip()
+        if headers:
+            t["headers"] = headers
+        if ed and ed.isdigit():
+            t["max_early_data"] = int(ed)
+            t["early_data_header_name"] = "Sec-WebSocket-Protocol"
+        return t
+    if net == "grpc":
+        t = {"type": "grpc"}
+        sn = service_name or path or ""
+        if sn:
+            t["service_name"] = sn
+        return t
+    if net == "http":
+        t = {"type": "http"}
+        if host:
+            t["host"] = [h.strip() for h in host.split(",") if h.strip()]
+        if path:
+            t["path"] = path
+        return t
+    if net == "httpupgrade":
+        t = {"type": "httpupgrade"}
+        if host:
+            t["host"] = host
+        if path:
+            t["path"] = path
+        return t
+    return None
+
+
+def parse_vmess(link):
+    raw = link[len("vmess://"):].strip()
+    payload = None
+    try:
+        decoded = base64.b64decode(b64pad(raw)).decode()
+        if decoded.lstrip().startswith("{"):
+            payload = json.loads(decoded)
+    except Exception:
+        payload = None
+    if payload is None:
+        if "{" in raw:
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                return None
+        else:
+            return None
+
+    def g(key, default=""):
+        val = payload.get(key, default)
+        return default if val is None else str(val).strip()
+
+    host = g("add")
+    port_s = g("port")
+    uuid = g("id")
+    if not host or not uuid or not port_s.isdigit():
+        return None
+    name = g("ps") or f"{host}:{port_s}"
+    net = g("net").lower()
+    profile = {
+        "proto": "vmess",
+        "name": name,
+        "server": host,
+        "server_port": int(port_s),
+        "uuid": uuid,
+        "security": g("scy").lower() or "auto",
+        "alter_id": int(g("aid")) if g("aid").isdigit() else 0,
+        "packet_encoding": "xudp",
+    }
+    if g("tls").lower() in ("tls", "reality"):
+        tls = {"enabled": True}
+        sni = g("sni") or g("host")
+        if sni:
+            tls["server_name"] = sni
+        if g("fp"):
+            tls["utls"] = {"enabled": True, "fingerprint": g("fp")}
+        alpn = g("alpn")
+        if alpn:
+            tls["alpn"] = [a for a in alpn.split(",") if a]
+        profile["tls"] = tls
+    transport = build_transport(net, g("path"), g("host"), "", "", {})
+    if transport:
+        profile["transport"] = transport
+    return profile
+
+
+def parse_ss(url):
+    """Parse ss:// links. Two common shapes:
+      ss://base64(method:password@host:port)#name          (fully-encoded)
+      ss://base64(method:password)@host:port#name          (SIP002)
+    Plugin params (?plugin=...) are stored but not used by our generators."""
+    raw = url[len("ss://"):]
+    name = ""
+    if "#" in raw:
+        raw, name = raw.split("#", 1)
+        name = unquote(name).strip()
+
+    plugin = {}
+    query = {}
+    if "?" in raw:
+        raw, qs = raw.split("?", 1)
+        query = parse_qs(qs)
+        pl = q(query, "plugin")
+        if pl:
+            parts = pl.split(";", 1)
+            plugin = {"name": parts[0]}
+            if len(parts) > 1:
+                for kv in parts[1].split(";"):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        plugin[k] = v
+
+    userinfo, sep, hostport = raw.rpartition("@")
+    if not sep:
+        # fully-encoded form: everything is base64(method:password@host:port)
+        try:
+            decoded = base64.b64decode(b64pad(raw)).decode()
+        except Exception:
+            return None
+        if "@" not in decoded:
+            return None
+        userinfo, _, hostport = decoded.rpartition("@")
+
+    method_pass = ""
+    if userinfo:
+        try:
+            method_pass = base64.b64decode(b64pad(userinfo)).decode()
+        except Exception:
+            method_pass = unquote(userinfo)
+    if "@" in method_pass or ":" not in method_pass:
+        return None
+    method, password = method_pass.split(":", 1)
+
+    hostport = unquote(hostport)
+    # handle [ipv6]:port
+    if hostport.startswith("[") and "]" in hostport:
+        host, _, port_s = hostport.partition("]:")
+        host = host[1:]
+    else:
+        host, _, port_s = hostport.rpartition(":")
+    if not host or not port_s.isdigit():
+        return None
+
+    profile = {
+        "proto": "ss",
+        "name": name or f"{host}:{port_s}",
+        "server": host,
+        "server_port": int(port_s),
+        "cipher": method.strip(),
+        "password": password,
+    }
+    if plugin:
+        profile["plugin"] = plugin
+    return profile
+
+
+def parse_socks(url):
+    """Parse socks://, socks5://, and socks4:// share links.
+    Shapes: socks[s4|5]://[user:pass@]host:port#name  (query params also accepted)."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return None
+    if parsed.scheme not in ("socks", "socks5", "socks5h", "socks4"):
+        return None
+    host = parsed.hostname or ""
+    port = parsed.port or 1080
+    if not host:
+        return None
+    name = unquote(parsed.fragment or "").strip() or f"{host}:{port}"
+    params = parse_qs(parsed.query)
+    user = unquote(parsed.username or "") or q(params, "user")
+    password = ""
+    if parsed.password:
+        password = unquote(parsed.password)
+    elif user:
+        password = q(params, "pass") or q(params, "password")
+    # Distinguish SOCKS4 from SOCKS5 so the outbound version is correct
+    socks_version = "socks4" if parsed.scheme == "socks4" else "socks"
+    profile = {
+        "proto": socks_version,
+        "name": name,
+        "server": host,
+        "server_port": int(port),
+    }
+    if user:
+        profile["username"] = user
+        profile["password"] = password
+    return profile
+
+
+def _parse_any(raw):
+    """Dispatch a raw share link to the right parser; None if unrecognized."""
+    if raw.startswith("vless://"):
+        return parse_vless(raw)
+    if raw.startswith("vmess://"):
+        return parse_vmess(raw)
+    if raw.startswith("ss://"):
+        return parse_ss(raw)
+    if raw.startswith(("socks://", "socks5://", "socks5h://", "socks4://")):
+        return parse_socks(raw)
+    return None
+
+
+def extract_links(text):
+    text = text.strip()
+    links = []
+    if text and "://" not in text:
+        try:
+            decoded = base64.b64decode(b64pad(text)).decode(errors="ignore")
+            if "://" in decoded:
+                text = decoded
+        except Exception:
+            pass
+    schemes = ("vless://", "vmess://", "ss://", "socks://", "socks5://",
+               "socks5h://", "socks4://")
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith(schemes):
+            links.append(line)
+    if not links and text.startswith(schemes):
+        links = [text]
+    return links
+
+
+def normalize_profile(profile, raw_link):
+    key = raw_link.split("#")[0]
+    pid = fingerprint_of(key)
+    profile["id"] = pid
+    return profile
+
+
+# ---------------------------------------------------------------------------
+# URI builders (for QR code generation)
+# ---------------------------------------------------------------------------
+
+def _build_vless_uri(p):
+    """Build vless:// URI from a profile dict."""
+    uuid = p.get("uuid", "")
+    host = p.get("server", "")
+    port = p.get("server_port", 443)
+    tls = p.get("tls") or {}
+    transport = p.get("transport") or {}
+    tls_type = "reality" if tls.get("reality") else ("tls" if tls.get("enabled") else "none")
+    params = []
+    params.append(("type", transport.get("type", "tcp")))
+    params.append(("security", tls_type))
+    if tls.get("server_name"):
+        params.append(("sni", tls["server_name"]))
+    utls = tls.get("utls") or {}
+    if utls.get("fingerprint"):
+        params.append(("fp", utls["fingerprint"]))
+    alpn = tls.get("alpn")
+    if alpn:
+        params.append(("alpn", ",".join(alpn)))
+    reality = tls.get("reality") or {}
+    if reality.get("public_key"):
+        params.append(("pbk", reality["public_key"]))
+    if reality.get("short_id"):
+        params.append(("sid", reality["short_id"]))
+    if reality.get("spider_x"):
+        params.append(("spiderX", reality["spider_x"]))
+    if tls.get("insecure"):
+        params.append(("allowInsecure", "1"))
+    flow = p.get("flow", "")
+    if flow:
+        params.append(("flow", flow))
+    if transport.get("host"):
+        h = transport["host"]
+        params.append(("host", h if isinstance(h, str) else h[0]))
+    if transport.get("path"):
+        params.append(("path", transport["path"]))
+    if transport.get("service_name"):
+        params.append(("serviceName", transport["service_name"]))
+    name = quote(p.get("name", ""), safe="")
+    query = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in params)
+    return f"vless://{uuid}@{host}:{port}?{query}#{name}"
+
+
+def _build_vmess_uri(p):
+    """Build vmess:// URI (base64-encoded JSON array) from a profile dict."""
+    transport = p.get("transport") or {}
+    tls = p.get("tls") or {}
+    tls_type = "reality" if tls.get("reality") else ("tls" if tls.get("enabled") else "none")
+    payload = {
+        "v": "2",
+        "ps": p.get("name", ""),
+        "add": p.get("server", ""),
+        "port": str(p.get("server_port", 443)),
+        "id": p.get("uuid", ""),
+        "aid": str(p.get("alter_id", 0)),
+        "scy": p.get("security", "auto"),
+        "net": transport.get("type", "tcp"),
+        "type": "none",
+        "host": "",
+        "path": "",
+        "tls": tls_type,
+        "sni": "",
+        "fp": "",
+        "alpn": "",
+    }
+    if transport.get("host"):
+        h = transport["host"]
+        payload["host"] = h if isinstance(h, str) else h[0]
+    if transport.get("path"):
+        payload["path"] = transport["path"]
+    if tls.get("server_name"):
+        payload["sni"] = tls["server_name"]
+    utls = tls.get("utls") or {}
+    if utls.get("fingerprint"):
+        payload["fp"] = utls["fingerprint"]
+    alpn = tls.get("alpn")
+    if alpn:
+        payload["alpn"] = ",".join(alpn)
+    encoded = base64.b64encode(json.dumps([payload], ensure_ascii=False).encode()).decode()
+    return f"vmess://{encoded}"
+
+
+def _build_ss_uri(p):
+    """Build ss:// URI from a profile dict."""
+    method = p.get("method", p.get("cipher", ""))
+    password = p.get("password", "")
+    host = p.get("server", "")
+    port = p.get("server_port", 443)
+    name = quote(p.get("name", ""), safe="")
+    inner = base64.b64encode(f"{method}:{password}".encode()).decode()
+    return f"ss://{inner}@{host}:{port}#{name}"
+
+
+def _build_socks_uri(p):
+    """Build socks:// URI from a profile dict."""
+    user = p.get("username", "")
+    password = p.get("password", "")
+    host = p.get("server", "")
+    port = p.get("server_port", 1080)
+    name = quote(p.get("name", ""), safe="")
+    proto = p.get("proto", "socks")
+    scheme = "socks4" if proto == "socks4" else "socks"
+    auth = ""
+    if user:
+        auth = f"{quote(user, safe='')}:{quote(password, safe='')}@"
+    return f"{scheme}://{auth}{host}:{port}#{name}"
+
+
+def _build_uri(p):
+    """Build the share URI for a profile, dispatching by protocol."""
+    proto = p.get("proto", "")
+    if proto == "vless":
+        return _build_vless_uri(p)
+    if proto == "vmess":
+        return _build_vmess_uri(p)
+    if proto == "ss":
+        return _build_ss_uri(p)
+    if proto in ("socks", "socks4"):
+        return _build_socks_uri(p)
+    die(f"unsupported protocol for QR: {proto}")
+
+
+def cmd_qr(arg):
+    """Generate a QR code PNG for a profile's connection URI."""
+    if not arg:
+        die("qr requires a profile id")
+    store = load_store()
+    p = find_profile(store, arg)
+    if p is None:
+        die("profile not found: %s" % arg)
+    uri = _build_uri(p)
+    out_path = os.path.join(CONFIG_DIR, f"qr-{arg}.png")
+    cmd = f"echo {shlex.quote(uri)} | qrencode -o {shlex.quote(out_path)} -s 10"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode != 0:
+        die("qrencode failed: %s" % result.stderr.strip())
+    print(out_path)
+
+
+def cmd_import(arg, group=None):
+    text = ""
+    if arg == "-":
+        text = sys.stdin.read()
+    elif arg and os.path.exists(os.path.expanduser(arg)):
+        with open(os.path.expanduser(arg)) as f:
+            text = f.read()
+    elif arg:
+        text = arg
+    else:
+        text = sys.stdin.read()
+
+    links = extract_links(text)
+    if not links:
+        die("no vless:// vmess:// ss:// or socks:// links found in input")
+
+    store = load_store()
+    existing = {p["id"] for p in store["profiles"]}
+    added, skipped, duplicates, invalid = [], [], [], []
+    id_to_profile = {p["id"]: p for p in store["profiles"]}
+    for raw in links:
+        profile = None
+        profile = _parse_any(raw)
+        if profile is None:
+            skipped.append(raw[:60])
+            invalid.append(raw[:60])
+            continue
+        profile = normalize_profile(profile, raw)
+        if profile["id"] in existing:
+            dup = id_to_profile.get(profile["id"], {})
+            duplicates.append({
+                "name": profile.get("name", profile["id"]),
+                "group": dup.get("group", ""),
+            })
+            skipped.append(profile.get("name", profile["id"]))
+            continue
+        store["profiles"].append(profile)
+        existing.add(profile["id"])
+        id_to_profile[profile["id"]] = profile
+        if group:
+            profile["group"] = normalize_group(group)
+        added.append(profile.get("name", profile["id"]))
+        if not store.get("selected"):
+            store["selected"] = profile["id"]
+
+    save_store(store)
+    print(json.dumps({
+        "ok": True,
+        "added": added,
+        "skipped": skipped,
+        # Structured detail so UIs can explain WHY nothing was added.
+        # duplicates: already saved (with the group each copy lives in)
+        # invalid: link could not be parsed at all
+        "duplicates": duplicates,
+        "invalid": invalid,
+    }))
+
+
+def find_profile(store, pid):
+    for p in store["profiles"]:
+        if p["id"] == pid:
+            return p
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Groups
+# ---------------------------------------------------------------------------
+
+def normalize_group(name):
+    """Trim + collapse internal whitespace so 'Work' and ' work ' match."""
+    return " ".join(str(name).split())
+
+
+def groups_of(store):
+    """Sorted list of all group names: persisted + any from profile tags."""
+    names = set(store.get("groups") or [])
+    for p in store["profiles"]:
+        g = p.get("group")
+        if g:
+            names.add(normalize_group(g))
+    return sorted(names)
+
+
+def profiles_in_group(store, name):
+    """All profiles whose group matches `name` (whitespace-normalized)."""
+    want = normalize_group(name)
+    return [p for p in store["profiles"] if normalize_group(p.get("group") or "") == want]
+
+
+def profile_outbound(profile):
+    proto = profile["proto"]
+    if proto == "ss":
+        return {
+            "type": "shadowsocks",
+            "tag": "proxy",
+            "server": profile["server"],
+            "server_port": profile["server_port"],
+            "method": profile["cipher"],
+            "password": profile.get("password", ""),
+        }
+    if proto in ("socks", "socks4"):
+        out = {
+            "type": proto,
+            "tag": "proxy",
+            "server": profile["server"],
+            "server_port": profile["server_port"],
+        }
+        if proto == "socks":
+            out["version"] = "5"
+        if profile.get("username"):
+            out["username"] = profile["username"]
+            out["password"] = profile.get("password", "")
+        return out
+    out = {
+        "type": proto,
+        "tag": "proxy",
+        "server": profile["server"],
+        "server_port": profile["server_port"],
+        "uuid": profile["uuid"],
+        "packet_encoding": profile.get("packet_encoding", ""),
+    }
+    if proto == "vmess":
+        out["security"] = profile.get("security", "auto")
+        out["alter_id"] = profile.get("alter_id", 0)
+    if profile.get("flow"):
+        out["flow"] = profile["flow"]
+    if profile.get("tls"):
+        out["tls"] = profile["tls"]
+    if profile.get("transport"):
+        out["transport"] = profile["transport"]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Xray-core backend (config generation)
+# ---------------------------------------------------------------------------
+
+XRAY_WS_PATH_DEFAULT = "/"
+
+
+def xray_stream_settings(profile):
+    """Build xray streamSettings from a sing-box-style profile dict."""
+    st = {"network": "tcp", "security": "none"}
+    tls = profile.get("tls") or {}
+    transport = profile.get("transport") or {}
+
+    # network / transport layer
+    ttype = transport.get("type", "tcp")
+    if ttype == "ws":
+        st["network"] = "ws"
+        ws = {"path": transport.get("path", XRAY_WS_PATH_DEFAULT)}
+        headers = transport.get("headers") or {}
+        if headers:
+            ws["headers"] = dict(headers)
+        ed = transport.get("max_early_data")
+        if ed:
+            ws["max_early_data"] = int(ed)
+            ws["earlyDataHeaderName"] = transport.get("early_data_header_name",
+                                                      "Sec-WebSocket-Protocol")
+        st["wsSettings"] = ws
+    elif ttype == "grpc":
+        st["network"] = "grpc"
+        gs = {}
+        if transport.get("service_name"):
+            gs["serviceName"] = transport["service_name"]
+        st["grpcSettings"] = gs
+    elif ttype == "http":
+        st["network"] = "http"
+        hs = {}
+        if transport.get("host"):
+            hosts = transport["host"] if isinstance(transport["host"], list) else [transport["host"]]
+            hs["host"] = hosts
+        if transport.get("path"):
+            hs["path"] = transport["path"]
+        st["httpSettings"] = hs
+    elif ttype == "httpupgrade":
+        st["network"] = "httpupgrade"
+        hus = {}
+        if transport.get("host"):
+            hus["host"] = transport["host"]
+        if transport.get("path"):
+            hus["path"] = transport["path"]
+        st["httpupgradeSettings"] = hus
+
+    # security layer (tls / reality)
+    if tls.get("enabled"):
+        reality = tls.get("reality")
+        if reality and reality.get("enabled"):
+            st["security"] = "reality"
+            rs = {
+                "show": False,
+                "fingerprint": (tls.get("utls") or {}).get("fingerprint", "chrome"),
+                "publicKey": reality.get("public_key", ""),
+                "serverName": tls.get("server_name", ""),
+            }
+            if reality.get("short_id"):
+                rs["shortId"] = reality["short_id"]
+            st["realitySettings"] = rs
+        else:
+            st["security"] = "tls"
+            ts = {
+                "allowInsecure": bool(tls.get("insecure")),
+                "serverName": tls.get("server_name", ""),
+                "fingerprint": (tls.get("utls") or {}).get("fingerprint", ""),
+            }
+            alpn = tls.get("alpn")
+            if alpn:
+                ts["alpn"] = alpn
+            st["tlsSettings"] = ts
+    return st
+
+
+def xray_outbound(profile):
+    """Build an xray outbounds[] entry from our internal profile dict."""
+    proto = profile.get("proto")
+    if proto == "ss":
+        return {
+            "tag": "proxy",
+            "protocol": "shadowsocks",
+            "settings": {
+                "servers": [{
+                    "address": profile["server"],
+                    "port": profile["server_port"],
+                    "method": profile["cipher"],
+                    "password": profile.get("password", ""),
+                }],
+            },
+        }
+    if proto in ("socks", "socks4"):
+        server = {
+            "address": profile["server"],
+            "port": profile["server_port"],
+        }
+        user = profile.get("username", "")
+        if user:
+            server["users"] = [{"user": user, "pass": profile.get("password", "")}]
+        # NOTE: xray-core's socks outbound is SOCKS5 only — the source
+        # hardcodes socks5Version in the handshake.  SOCKS4 is still saved
+        # as proto=socks4 for sing-box (which does support it), but xray
+        # will attempt a SOCKS5 connection to that server.
+        return {
+            "tag": "proxy",
+            "protocol": "socks",
+            "settings": {"servers": [server]},
+        }
+    # vless / vmess
+    ss = xray_stream_settings(profile)
+    vnext = {
+        "address": profile["server"],
+        "port": profile["server_port"],
+        "users": [],
+    }
+    if proto == "vless":
+        user = {
+            "id": profile["uuid"],
+            "encryption": "none",
+            "level": 0,
+        }
+        flow = profile.get("flow")
+        if flow:
+            user["flow"] = flow
+        vnext["users"].append(user)
+        protocol = "vless"
+    elif proto == "vmess":
+        vnext["users"].append({
+            "id": profile["uuid"],
+            "alterId": int(profile.get("alter_id", 0)),
+            "security": profile.get("security", "auto"),
+            "level": 0,
+        })
+        protocol = "vmess"
+    else:
+        raise ValueError(f"xray backend does not support proto {proto}")
+    return {
+        "tag": "proxy",
+        "protocol": protocol,
+        "settings": {"vnext": [vnext]},
+        "streamSettings": ss,
+        "mux": {"enabled": False, "concurrency": -1},
+    }
+
+
+def xray_installed():
+    """True if `xray` is on PATH and usable."""
+    r = run(["which", "xray"])
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def backend():
+    """Return the current backend name from the store."""
+    return load_store().get("backend") or "sing-box"
+
+
+def cmd_backend(arg):
+    """Get or set the CLI backend ('sing-box' or 'xray')."""
+    store = load_store()
+    if not arg:
+        return print(json.dumps({"ok": True, "backend": backend()}))
+    if arg not in ("sing-box", "xray"):
+        die("backend must be 'sing-box' or 'xray'")
+    if arg == "xray" and not xray_installed():
+        die("xray is not installed — install xray-bin from AUR first")
+    store["backend"] = arg
+    save_store(store)
+    print(json.dumps({"ok": True, "backend": arg}))
+
+
+def cmd_group(arg):
+    """Manage profile groups: list | set <id> <name> | remove <id> | create <name> | delete <name>"""
+    store = load_store()
+    args = (arg or "").split(None, 2)
+    sub = args[0] if args else ""
+
+    if sub == "list" or not sub:
+        names = groups_of(store)
+        groups = {}
+        for name in names:
+            ps = profiles_in_group(store, name)
+            groups[name] = {
+                "count": len(ps),
+                "profiles": [{"id": p["id"], "name": p.get("name")} for p in ps],
+            }
+        ungrouped = len(store["profiles"]) - sum(g["count"] for g in groups.values())
+        return print(json.dumps({
+            "ok": True,
+            "groups": groups,
+            "ungrouped_count": ungrouped,
+        }))
+
+    if sub == "set":
+        if len(args) < 3:
+            die("usage: group set <id> <group-name>")
+        pid, name = args[1], args[2]
+        profile = find_profile(store, pid)
+        if profile is None:
+            die("profile not found: %s" % pid)
+        profile["group"] = normalize_group(name)
+        save_store(store)
+        return print(json.dumps({"ok": True, "id": pid, "group": profile["group"]}))
+
+    if sub == "remove":
+        if len(args) < 2:
+            die("usage: group remove <id>")
+        pid = args[1]
+        profile = find_profile(store, pid)
+        if profile is None:
+            die("profile not found: %s" % pid)
+        old = profile.get("group")
+        profile.pop("group", None)
+        save_store(store)
+        return print(json.dumps({"ok": True, "id": pid, "old_group": old}))
+
+    if sub == "create":
+        if len(args) < 2:
+            die("usage: group create <name>")
+        name = normalize_group(args[1])
+        existing = set(groups_of(store))
+        if name in existing:
+            die("group already exists: %s" % name)
+        # Persist the named group so empty groups survive.  Profiles can
+        # be moved in later via `group set <id> <name>`.
+        store.setdefault("groups", [])
+        store["groups"] = sorted(set(store["groups"]) | {name})
+        save_store(store)
+        return print(json.dumps({"ok": True, "group": name, "created": True}))
+
+    if sub == "delete":
+        if len(args) < 2:
+            die("usage: group delete <name>")
+        name = normalize_group(args[1])
+        # Drop the persisted group name...
+        if store.get("groups"):
+            store["groups"] = [g for g in store["groups"] if normalize_group(g) != name]
+        # ...and ungroup any profiles still tagged with it.
+        members = profiles_in_group(store, name)
+        for p in members:
+            p.pop("group", None)
+        save_store(store)
+        return print(json.dumps({"ok": True, "deleted": name, "ungrouped": len(members)}))
+
+    die("unknown group subcommand: %s (use list, set, remove)" % sub)
+
+
+# ---------------------------------------------------------------------------
+# Subscriptions
+# ---------------------------------------------------------------------------
+
+def find_subscription(store, group):
+    """Return the subscription dict for a group name, or None."""
+    want = normalize_group(group)
+    for s in store.get("subscriptions", []):
+        if normalize_group(s.get("group", "")) == want:
+            return s
+    return None
+
+
+def fetch_subscription(url, timeout=20):
+    """GET a subscription URL and return decoded body text.
+
+    Subscription bodies are usually a base64 blob of vless:// vmess:// …
+    links, sometimes plain text. extract_links() handles both via base64
+    decode and per-line splitting.
+    """
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "omarchy-v2ray/1.0", "Accept": "*/*"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        charset = resp.headers.get_content_charset() or "utf-8"
+        raw = resp.read()
+    return raw.decode(charset, errors="replace")
+
+
+def derive_subscription_name(url):
+    """Default group name from a subscription URL: its hostname lower-cased."""
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        host = ""
+    host = host.strip().lower()
+    if host:
+        return host
+    parts = [p for p in urlparse(url).path.split("/") if p]
+    return parts[-1] if parts else "subscription"
+
+
+def cmd_subscription_add(url, group=None):
+    if not url or not url.startswith(("http://", "https://")):
+        die("subscription add requires an http(s) url")
+    name = normalize_group(group) if group else derive_subscription_name(url)
+    store = load_store()
+    if find_subscription(store, name):
+        die("subscription already exists for group: %s" % name)
+    try:
+        body = fetch_subscription(url)
+    except Exception as e:
+        die("failed to fetch subscription: %s" % e)
+    links = extract_links(body)
+    if not links:
+        die("no vless:// vmess:// ss:// or socks:// links found in subscription")
+    existing = {p["id"] for p in store["profiles"]}
+    added, duplicates, invalid = [], [], []
+    id_to_profile = {p["id"]: p for p in store["profiles"]}
+    for raw in links:
+        profile = _parse_any(raw)
+        if profile is None:
+            invalid.append(raw[:60])
+            continue
+        profile = normalize_profile(profile, raw)
+        if profile["id"] in existing:
+            dup = id_to_profile.get(profile["id"], {})
+            duplicates.append({"name": profile.get("name", profile["id"]),
+                               "group": dup.get("group", "")})
+            continue
+        profile["group"] = normalize_group(name)
+        store["profiles"].append(profile)
+        existing.add(profile["id"])
+        id_to_profile[profile["id"]] = profile
+        added.append(profile.get("name", profile["id"]))
+        if not store.get("selected"):
+            store["selected"] = profile["id"]
+    # Persist group name + subscription metadata
+    store.setdefault("groups", [])
+    store["groups"] = sorted(set(store["groups"]) | {normalize_group(name)})
+    subs = store.setdefault("subscriptions", [])
+    subs.append({
+        "group": normalize_group(name),
+        "url": url,
+        "added": len(added),
+        "updated_at": int(time.time()),
+    })
+    save_store(store)
+    print(json.dumps({
+        "ok": True,
+        "subscription_added": normalize_group(name),
+        "url": url,
+        "added": added,
+        "duplicates": duplicates,
+        "invalid": invalid,
+    }))
+
+
+def cmd_subscription_update(group):
+    store = load_store()
+    sub = find_subscription(store, group)
+    if sub is None:
+        die("no subscription for group: %s" % group)
+    try:
+        body = fetch_subscription(sub["url"])
+    except Exception as e:
+        die("failed to fetch subscription: %s" % e)
+    links = extract_links(body)
+    if not links:
+        die("subscription returned no links")
+    want = normalize_group(group)
+    before = len(store["profiles"])
+    # Drop current group members, re-import fresh
+    store["profiles"] = [p for p in store["profiles"]
+                         if normalize_group(p.get("group") or "") != want]
+    removed = before - len(store["profiles"])
+    existing = {p["id"] for p in store["profiles"]}
+    added = []
+    for raw in links:
+        profile = _parse_any(raw)
+        if profile is None:
+            continue
+        profile = normalize_profile(profile, raw)
+        if profile["id"] in existing:
+            continue  # already in another group
+        profile["group"] = want
+        store["profiles"].append(profile)
+        existing.add(profile["id"])
+        added.append(profile.get("name", profile["id"]))
+    sub["added"] = len(added)
+    sub["updated_at"] = int(time.time())
+    save_store(store)
+    print(json.dumps({
+        "ok": True,
+        "subscription_updated": want,
+        "added": len(added),
+        "removed": removed,
+    }))
+
+
+def cmd_subscription_remove(group):
+    store = load_store()
+    want = normalize_group(group)
+    before = len(store["profiles"])
+    store["profiles"] = [p for p in store["profiles"]
+                         if normalize_group(p.get("group") or "") != want]
+    removed_profiles = before - len(store["profiles"])
+    store["subscriptions"] = [s for s in store.get("subscriptions", [])
+                              if normalize_group(s.get("group", "")) != want]
+    if store.get("groups"):
+        store["groups"] = [g for g in store["groups"]
+                           if normalize_group(g) != want]
+    save_store(store)
+    print(json.dumps({
+        "ok": True,
+        "subscription_removed": want,
+        "removed_profiles": removed_profiles,
+    }))
+
+
+def cmd_subscription_refetch_all():
+    """Refetch every subscription in one shot. Called by the auto-refetch timer."""
+    store = load_store()
+    subs = store.get("subscriptions", [])
+    if not subs:
+        return print(json.dumps({"ok": True, "refetched": 0}))
+    total_added = 0
+    total_errors = []
+    for sub in subs:
+        group = normalize_group(sub.get("group", ""))
+        url = sub.get("url", "")
+        if not url:
+            total_errors.append({"group": group, "error": "no url"})
+            continue
+        try:
+            body = fetch_subscription(url)
+        except Exception as e:
+            total_errors.append({"group": group, "error": str(e)})
+            continue
+        links = extract_links(body)
+        if not links:
+            total_errors.append({"group": group, "error": "no links in response"})
+            continue
+        want = normalize_group(group)
+        before = len(store["profiles"])
+        store["profiles"] = [p for p in store["profiles"]
+                             if normalize_group(p.get("group") or "") != want]
+        existing = {p["id"] for p in store["profiles"]}
+        added = []
+        for raw in links:
+            profile = _parse_any(raw)
+            if profile is None:
+                continue
+            profile = normalize_profile(profile, raw)
+            if profile["id"] in existing:
+                continue
+            profile["group"] = want
+            store["profiles"].append(profile)
+            existing.add(profile["id"])
+            added.append(profile.get("name", profile["id"]))
+        sub["added"] = len(added)
+        sub["updated_at"] = int(time.time())
+        total_added += len(added)
+    save_store(store)
+    print(json.dumps({
+        "ok": True,
+        "refetched": len(subs),
+        "added": total_added,
+        "errors": total_errors,
+        "updated_at": int(time.time()),
+    }))
+
+
+def cmd_subscription(arg, group=None):
+    args = (arg or "").split()
+    sub = args[0] if args else ""
+    if sub == "add":
+        if len(args) < 2:
+            die("usage: subscription add <url> [--group <name>]")
+        return cmd_subscription_add(args[1], group=group)
+    if sub == "update":
+        if len(args) < 2:
+            die("usage: subscription update <group>")
+        return cmd_subscription_update(args[1])
+    if sub == "remove":
+        if len(args) < 2:
+            die("usage: subscription remove <group>")
+        return cmd_subscription_remove(args[1])
+    if sub == "refetch-all":
+        return cmd_subscription_refetch_all()
+    if sub == "list" or not sub:
+        return print(json.dumps({"ok": True,
+                                 "subscriptions": load_store().get("subscriptions", [])}))
+    die("unknown subscription subcommand: %s" % sub)
+
+
+def generate_xray_config(profile):
+    """Write XRAY_CONFIG for the given profile; returns its path."""
+    ensure_dirs()
+    outbound = xray_outbound(profile)
+    cfg = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": MIXED_PORT,
+            "settings": {"auth": "noauth", "udp": True},
+        }],
+        "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
+        # first outbound ("proxy") is the default; no extra rules needed
+    }
+    with open(XRAY_CONFIG, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return XRAY_CONFIG
+
+
+def generate_xray_tun_config(profile):
+    """Write XRAY_TUN_CONFIG: xray-core with TUN inbound (system-wide VPN).
+    xray-core TUN schema (from proxy/tun/config.proto):
+      gateway                     - interface addresses
+      auto_system_routing_table   - CIDRs routed into the tun device
+      auto_outbounds_interface    - binds outbounds to the pre-tun iface
+                                    ("auto" = detect), preventing routing loop"""
+    ensure_dirs()
+    outbound = xray_outbound(profile)
+    cfg = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "tun-in",
+            "protocol": "tun",
+            "settings": {
+                "name": "omarchy-tun",
+                "MTU": 9000,
+                "gateway": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+                "auto_system_routing_table": ["0.0.0.0/0", "::/0"],
+                "auto_outbounds_interface": "auto",
+            },
+        }],
+        "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
+    }
+    with open(XRAY_TUN_CONFIG, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return XRAY_TUN_CONFIG
+
+
+def check_xray_config(path):
+    """Validate an xray config file. Returns (ok, error_message).
+    Note: `xray run -test` fully instantiates inbounds, so TUN configs fail
+    with 'operation not permitted' when run without CAP_NET_ADMIN. That
+    specific failure means the config parsed cleanly -> treat as valid."""
+    r = subprocess.run(["xray", "run", "-test", "-c", path],
+                       capture_output=True, text=True)
+    out = (r.stderr or "") + (r.stdout or "")
+    if r.returncode == 0:
+        return True, ""
+    # Config parsed OK but couldn't create privileged resources (tun device):
+    # - "operation not permitted": running without CAP_NET_ADMIN
+    # - "device or resource busy": the live TUN service already holds the device
+    if "operation not permitted" in out or "device or resource busy" in out:
+        return True, ""
+    err = (r.stderr or r.stdout or "").strip()
+    return False, err
+
+
+def xray_build_ping_config(profile, port):
+    """Config for a one-shot xray ping test on the given port."""
+    outbound = xray_outbound(profile)
+    return {
+        "log": {"loglevel": "none"},
+        "inbounds": [{
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": port,
+            "settings": {"auth": "noauth", "udp": True},
+        }],
+        "outbounds": [outbound, {"protocol": "freedom", "tag": "direct"}],
+    }
+
+
+def _xray_ping_one(profile, port):
+    """Ping one profile using a fresh xray process."""
+    cfg_path = os.path.join(CONFIG_DIR, "ping-xray-%s.json" % profile["id"])
+    cfg = xray_build_ping_config(profile, port)
+    with open(cfg_path, "w") as f:
+        json.dump(cfg, f)
+    proc = subprocess.Popen(
+        ["xray", "run", "-c", cfg_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    result = {"ms": None, "error": "", "ip": ""}
+    try:
+        deadline = time.time() + 3
+        ready = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                result["error"] = "config failed"
+                return result
+            try:
+                s = socket.create_connection(("127.0.0.1", port), 0.2)
+                s.close()
+                ready = True
+                break
+            except OSError:
+                time.sleep(0.08)
+        if ready:
+            t0 = time.perf_counter()
+            r = subprocess.run(
+                ["curl", "-s", "--max-time", "6", "--proxy",
+                 "socks5h://127.0.0.1:%d" % port, "https://api.ipify.org"],
+                capture_output=True, text=True,
+            )
+            dt = (time.perf_counter() - t0) * 1000
+            ip = r.stdout.strip()
+            if r.returncode == 0 and ip and len(ip) <= 45:
+                result["ms"] = int(dt)
+                result["ip"] = ip
+            else:
+                result["error"] = "no response"
+        else:
+            result["error"] = "timeout"
+        return result
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+        try:
+            os.remove(cfg_path)
+        except OSError:
+            pass
+
+
+def generate_configs(profile):
+    ensure_dirs()
+    outbound = profile_outbound(profile)
+    direct = {"type": "direct", "tag": "direct"}
+
+    proxy_cfg = {
+        "log": {"level": "warn", "timestamp": True},
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": MIXED_PORT,
+            }
+        ],
+        "outbounds": [outbound, direct],
+        "route": {"final": "proxy"},
+    }
+
+    tun_cfg = {
+        "log": {"level": "warn", "timestamp": True},
+        "dns": {
+            "servers": [
+                {"type": "local", "tag": "dns-direct"},
+                {
+                    "type": "https",
+                    "tag": "dns-remote",
+                    "server": "1.1.1.1",
+                    "detour": "proxy",
+                },
+            ],
+            "final": "dns-remote",
+            "strategy": "prefer_ipv4",
+        },
+        "inbounds": [
+            {
+                "type": "tun",
+                "tag": "tun-in",
+                "interface_name": "omarchy-tun",
+                "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+                "mtu": 9000,
+                "auto_route": True,
+                "strict_route": True,
+                "auto_redirect": False,
+                "stack": "gvisor",
+            }
+        ],
+        "outbounds": [dict(outbound), direct],
+        "route": {
+            "rules": [
+                {"action": "sniff"},
+                {"protocol": "dns", "action": "hijack-dns"},
+                {"ip_is_private": True, "outbound": "direct"},
+            ],
+            "final": "proxy",
+            "auto_detect_interface": True,
+            "default_domain_resolver": {"server": "dns-direct"},
+        },
+    }
+
+    with open(PROXY_CONFIG, "w") as f:
+        json.dump(proxy_cfg, f, indent=2)
+    with open(TUN_CONFIG, "w") as f:
+        json.dump(tun_cfg, f, indent=2)
+
+
+def check_config(path):
+    r = subprocess.run(["sing-box", "check", "-c", path], capture_output=True, text=True)
+    return r.returncode == 0, (r.stderr or "").strip()
+
+
+def run(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def user_unit_exists(name):
+    """True if a user-level systemd unit with this name is installed."""
+    r = run(["systemctl", "--user", "list-unit-files", name, "--no-legend"])
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def service_active(name, user=False):
+    args = ["systemctl"]
+    if user:
+        args.append("--user")
+    args += ["is-active", name]
+    r = run(args)
+    return r.stdout.strip() == "active"
+
+
+def current_mode_running(store):
+    mode = store.get("mode", "proxy")
+    if mode == "tun":
+        if backend() == "xray":
+            # Check user-level unit first (setcap), then system-level
+            if user_unit_exists(XRAY_TUN_SERVICE):
+                return XRAY_TUN_SERVICE, True, service_active(XRAY_TUN_SERVICE, user=True)
+            return XRAY_TUN_SERVICE, False, service_active(XRAY_TUN_SERVICE)
+        return TUN_SERVICE, False, service_active(TUN_SERVICE)
+    if backend() == "xray":
+        return XRAY_SERVICE, True, service_active(XRAY_SERVICE, user=True)
+    return USER_SERVICE, True, service_active(USER_SERVICE, user=True)
+
+
+def cmd_connect(pid=None, group=None):
+    store = load_store()
+    sel_backend = backend()
+    if pid == "best":
+        targets = store["profiles"]
+        if group:
+            targets = profiles_in_group(store, group)
+            if not targets:
+                die("no profiles in group: %s" % group)
+        if not targets:
+            die("no profiles to connect")
+        results = ping_profiles(targets)
+        best = None
+        for p in targets:
+            r = results.get(p["id"], {})
+            if r.get("ms") is not None and (
+                best is None or r["ms"] < results[best["id"]]["ms"]
+            ):
+                best = p
+        if best is None:
+            die("all profiles unreachable — import a working link")
+        pid = best["id"]
+    pid = pid or store.get("selected")
+    profile = find_profile(store, pid)
+    if profile is None:
+        die("profile not found: %s" % pid)
+    store["selected"] = profile["id"]
+    mode = store.get("mode", "proxy")
+
+    # --- xray backend (vless / vmess only) ---
+    if sel_backend == "xray":
+        generate_xray_config(profile)
+        ok, err = check_xray_config(XRAY_CONFIG)
+        if not ok:
+            die("xray config invalid: %s" % err)
+        if mode == "tun":
+            generate_xray_tun_config(profile)
+            ok_tun, err_tun = check_xray_config(XRAY_TUN_CONFIG)
+            if not ok_tun:
+                die("xray tun config invalid: %s" % err_tun)
+    else:
+        generate_configs(profile)
+        ok, err = check_config(PROXY_CONFIG)
+        if not ok:
+            die("config invalid: %s" % err)
+        ok_tun, err_tun = check_config(TUN_CONFIG)
+        if not ok_tun:
+            die("tun config invalid: %s" % err_tun)
+
+    save_store(store)
+    if mode == "tun" and sel_backend == "xray":
+        run(["systemctl", "--user", "stop", USER_SERVICE])
+        run(["systemctl", "--user", "stop", XRAY_SERVICE])
+        # Prefer user-level unit (works when xray has cap_net_admin via setcap).
+        if service_active(XRAY_TUN_SERVICE, user=True) or user_unit_exists(XRAY_TUN_SERVICE):
+            r = run(["systemctl", "--user", "start", XRAY_TUN_SERVICE])
+        else:
+            r = run(["pkexec", "systemctl", "start", XRAY_TUN_SERVICE])
+    elif mode == "tun":
+        run(["systemctl", "--user", "stop", USER_SERVICE])
+        run(["systemctl", "--user", "stop", XRAY_SERVICE])
+        r = run(["pkexec", "systemctl", "start", TUN_SERVICE])
+    elif sel_backend == "xray":
+        run(["systemctl", "--user", "stop", USER_SERVICE])
+        run(["systemctl", "stop", TUN_SERVICE])
+        r = run(["systemctl", "--user", "start", XRAY_SERVICE])
+    else:
+        run(["systemctl", "stop", TUN_SERVICE])
+        run(["systemctl", "--user", "stop", XRAY_SERVICE])
+        r = run(["systemctl", "--user", "start", USER_SERVICE])
+    if r.returncode != 0:
+        die("service start failed: %s" % (r.stderr or r.stdout).strip())
+    if mode == "tun":
+        # TUN routes are added by the wrapper script AFTER xray creates the
+        # device. Probe too early and curl answers DIRECT (Iran IP) while the
+        # tunnel is still coming up. Wait until the TUN default route exists.
+        for _ in range(20):
+            rt = run(["ip", "route", "show"]).stdout
+            if "dev omarchy-tun" in rt and "0.0.0.0/0" in rt:
+                break
+            time.sleep(0.5)
+    time.sleep(1.2)
+    exit_ip = fetch_exit_ip(mode, force=True)
+    if not exit_ip:
+        merge_state(ip="", ts=0, mode=mode)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "connected": profile["name"],
+                "mode": mode,
+                "verified": bool(exit_ip),
+                "exit_ip": exit_ip,
+            }
+        )
+    )
+
+
+def cmd_disconnect(_arg):
+    run(["systemctl", "--user", "stop", USER_SERVICE])
+    run(["systemctl", "--user", "stop", XRAY_SERVICE])
+    run(["systemctl", "--user", "stop", XRAY_TUN_SERVICE])   # user-level unit
+    if not user_unit_exists(XRAY_TUN_SERVICE):
+        run(["pkexec", "systemctl", "stop", XRAY_TUN_SERVICE])  # system-level unit
+    run(["pkexec", "systemctl", "stop", TUN_SERVICE])
+    clear_state()
+    print(json.dumps({"ok": True, "disconnected": True}))
+
+
+def cmd_mode(arg):
+    if arg not in ("proxy", "tun"):
+        die("mode must be proxy or tun")
+    store = load_store()
+    was_running = (service_active(USER_SERVICE, user=True) or
+                   service_active(XRAY_SERVICE, user=True) or
+                   service_active(TUN_SERVICE) or
+                   service_active(XRAY_TUN_SERVICE))
+    store["mode"] = arg
+    save_store(store)
+    if was_running:
+        return cmd_connect(store.get("selected"))
+    print(json.dumps({"ok": True, "mode": arg}))
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def merge_state(**kv):
+    st = load_state()
+    st.update(kv)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, STATE_PATH)
+    return st
+
+
+def clear_state():
+    try:
+        st = load_state()
+        keep = {}
+        for k in ("pings", "ping_history", "geo"):
+            if st.get(k):
+                keep[k] = st[k]
+        with open(STATE_PATH, "w") as f:
+            json.dump(keep, f)
+    except OSError:
+        pass
+
+
+def fetch_exit_ip(mode, force=False):
+    state = load_state()
+    now = time.time()
+    if (
+        not force
+        and state.get("ip")
+        and now - state.get("ts", 0) < 30
+        and state.get("mode") == mode
+    ):
+        return state["ip"]
+    cmd = ["curl", "-s", "--max-time", "7"]
+    if mode == "proxy":
+        cmd += ["--proxy", "socks5h://127.0.0.1:%d" % MIXED_PORT]
+    cmd += ["https://api.ipify.org"]
+    r = run(cmd)
+    ip = r.stdout.strip()
+    if r.returncode == 0 and ip and len(ip) <= 45 and "\n" not in ip:
+        merge_state(ip=ip, ts=now, mode=mode)
+        return ip
+    return ""
+
+
+# ── Geo / country flag ─────────────────────────────────────────────────────
+
+def _cc_to_flag(cc):
+    """ISO-3166-1 alpha-2 → regional-indicator flag emoji."""
+    cc = (cc or "").upper().strip()
+    if len(cc) != 2 or not cc.isalpha():
+        return ""
+    # Regional indicators start at U+1F1E6 (= 'A'); two letters make a flag.
+    return "".join(chr(0x1F1E6 + ord(c)) for c in cc)
+
+
+def fetch_geo(mode, force=False):
+    """Return (country_code, country_name, city) for the current exit IP.
+    Queries ip-api.com through the tunnel so it sees the VPN exit address.
+    Returns ("", "", "") on any failure or when the tunnel is not running."""
+    state = load_state()
+    now = time.time()
+    cached = state.get("geo") or {}
+    if (
+        not force
+        and cached.get("cc")
+        and now - cached.get("ts", 0) < GEO_CACHE_SEC
+    ):
+        return cached["cc"], cached.get("country", ""), cached.get("city", "")
+    if mode != "proxy":
+        return "", "", ""
+    cmd = [
+        "curl", "-s", "--max-time", "5",
+        "--proxy", "socks5h://127.0.0.1:%d" % MIXED_PORT,
+        "http://ip-api.com/json/?fields=status,countryCode,country,city",
+    ]
+    r = run(cmd)
+    try:
+        d = json.loads(r.stdout.strip())
+        if d.get("status") == "success":
+            geo = {"cc": d["countryCode"], "country": d["country"],
+                   "city": d["city"], "ts": now}
+            merge_state(geo=geo)
+            return geo["cc"], geo["country"], geo["city"]
+    except Exception:
+        pass
+    return "", "", ""
+
+
+def build_ping_config(profile, port):
+    return {
+        "log": {"level": "error"},
+        "inbounds": [
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": port,
+            }
+        ],
+        "outbounds": [profile_outbound(profile), {"type": "direct", "tag": "direct"}],
+        "route": {"final": "proxy", "auto_detect_interface": True},
+    }
+
+
+def _ping_one(profile, port):
+    cfg_path = os.path.join(CONFIG_DIR, "ping-%s.json" % profile["id"])
+    with open(cfg_path, "w") as f:
+        json.dump(build_ping_config(profile, port), f)
+    proc = subprocess.Popen(
+        ["sing-box", "run", "-c", cfg_path],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    result = {"ms": None, "error": "", "ip": ""}
+    try:
+        deadline = time.time() + 3
+        ready = False
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                result["error"] = "config failed"
+                return result
+            try:
+                s = socket.create_connection(("127.0.0.1", port), 0.2)
+                s.close()
+                ready = True
+                break
+            except OSError:
+                time.sleep(0.08)
+        if ready:
+            t0 = time.perf_counter()
+            r = subprocess.run(
+                [
+                    "curl",
+                    "-s",
+                    "--max-time",
+                    "6",
+                    "--proxy",
+                    "socks5h://127.0.0.1:%d" % port,
+                    "https://api.ipify.org",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            dt = (time.perf_counter() - t0) * 1000
+            ip = r.stdout.strip()
+            if r.returncode == 0 and ip and len(ip) <= 45:
+                result["ms"] = int(dt)
+                result["ip"] = ip
+            else:
+                result["error"] = "no response"
+        else:
+            result["error"] = "timeout"
+        return result
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+        try:
+            os.remove(cfg_path)
+        except OSError:
+            pass
+
+
+def ping_profiles(targets):
+    sel_backend = backend()
+    items = list(enumerate(targets))
+
+    def work(item):
+        i, p = item
+        if sel_backend == "xray" and p.get("proto") in ("vless", "vmess"):
+            fn = _xray_ping_one
+        else:
+            fn = _ping_one
+        return p["id"], fn(p, PING_PORT_BASE + (i % 40))
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(4, max(1, len(items)))) as ex:
+        for pid, res in ex.map(work, items):
+            results[pid] = res
+    st = load_state()
+    pings = st.get("pings", {})
+    pings.update(results)
+    # Latency history for sparklines: keep the last N results per profile.
+    # A failed probe appends null so dead periods show as gaps in the trend.
+    hist = st.get("ping_history", {})
+    for pid_key, res in results.items():
+        h = list(hist.get(pid_key, []))
+        ms = res.get("ms")
+        if ms is not None and (h and h[-1] is not None and abs(h[-1] - ms) <= 2):
+            continue  # skip near-identical consecutive values
+        h.append(ms)
+        hist[pid_key] = h[-HISTORY_MAX:]
+    merge_state(pings=pings, ping_history=hist)
+    return results
+
+
+def _latency_key(p, results):
+    """Sort key: reachable first (by ms ascending), unreachable last.
+    Equal latencies keep input order (stable sort)."""
+    r = results.get(p["id"])
+    ms = r.get("ms") if isinstance(r, dict) else None
+    reachable = 0 if isinstance(ms, (int, float)) and ms is not False else 1
+    return (reachable, ms if reachable == 0 else 1e18)
+
+
+def _sort_targets_in_store(store, results, targets):
+    """Reorder the tested profiles by latency inside the store.
+    Fastest reachable first, unreachable (None ms) sink to the bottom.
+    Non-tested profiles keep their original positions."""
+    if not targets or len(targets) < 2:
+        return
+    target_ids = {t["id"] for t in targets}
+    ordered = sorted(targets, key=lambda p: _latency_key(p, results))
+    kept = [p for p in store["profiles"] if p["id"] not in target_ids]
+    store["profiles"] = kept + ordered
+    save_store(store)
+
+
+def cmd_ping(arg):
+    store = load_store()
+    if arg and arg.startswith("group:"):
+        targets = profiles_in_group(store, arg[len("group:"):])
+        if not targets:
+            die("no profiles in group: %s" % arg[len("group:"):])
+    elif arg in (None, "", "all"):
+        targets = list(store["profiles"])
+        if not targets:
+            die("no profiles to test")
+    else:
+        p = find_profile(store, arg)
+        if p is None:
+            die("profile not found: %s" % arg)
+        targets = [p]
+
+    results = ping_profiles(targets)
+    # After a full "Test all" (or group) run, sort profiles by result.
+    if arg in (None, "", "all") or arg.startswith("group:"):
+        _sort_targets_in_store(store, results, targets)
+    print(json.dumps({"ok": True, "results": results}))
+
+
+def cmd_status(_arg):
+    store = load_store()
+    sel_backend = backend()
+    mode = store.get("mode", "proxy")
+    unit, _, running = current_mode_running(store)
+    active = find_profile(store, store.get("selected"))
+    status = {
+        "ok": True,
+        "mode": mode,
+        "backend": sel_backend,
+        "xray_installed": xray_installed(),
+        "unit": unit,
+        "running": running,
+        "active": active,
+        "profiles": [
+            {
+                "id": p["id"],
+                "name": p.get("name"),
+                "group": p.get("group"),
+                "proto": p["proto"],
+                "server": p["server"],
+                "server_port": p["server_port"],
+            }
+            for p in store["profiles"]
+        ],
+        "groups": groups_of(store),   # persisted named groups
+        "subscription_groups": {
+            normalize_group(s.get("group", "")): {
+                "url": s.get("url", ""),
+                "updated_at": s.get("updated_at", 0),
+                "added": s.get("added", 0),
+            }
+            for s in store.get("subscriptions", [])
+        },   # group -> {url, updated_at} for subscription pills
+        "exit_ip": "",
+        "pings": load_state().get("pings", {}),
+    }
+    if running:
+        status["exit_ip"] = fetch_exit_ip(mode)
+        cc, country, city = fetch_geo(mode)
+        status["geo"] = {
+            "cc": cc,
+            "flag": _cc_to_flag(cc),
+            "country": country,
+            "city": city,
+        }
+    status["ping_history"] = load_state().get("ping_history", {})
+    print(json.dumps(status))
+
+
+def cmd_list(_arg, group=None):
+    store = load_store()
+    profiles = store["profiles"]
+    if group is not None:
+        profiles = profiles_in_group(store, group)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "selected": store.get("selected"),
+                "mode": store.get("mode", "proxy"),
+                "group": normalize_group(group) if group else None,
+                "profiles": profiles,
+            }
+        )
+    )
+
+
+def cmd_select(arg):
+    store = load_store()
+    if find_profile(store, arg) is None:
+        die("profile not found: %s" % arg)
+    store["selected"] = arg
+    save_store(store)
+    print(json.dumps({"ok": True, "selected": arg}))
+
+
+def cmd_remove(arg):
+    store = load_store()
+    before = len(store["profiles"])
+    store["profiles"] = [p for p in store["profiles"] if p["id"] != arg]
+    if len(store["profiles"]) == before:
+        die("profile not found: %s" % arg)
+    if store.get("selected") == arg:
+        store["selected"] = store["profiles"][0]["id"] if store["profiles"] else None
+    save_store(store)
+    print(json.dumps({"ok": True, "removed": arg}))
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        print(
+            "usage: omarchy-v2ray import|-|<links>|<file> | list | status | "
+            "connect [id|best|group:<name>] | disconnect | mode proxy|tun | "
+            "select <id> | remove <id> | ping all|<id>|group:<name> | "
+            "qr <id> | "
+            "group list | group set <id> <name> | group remove <id>\n"
+            "       subscription add <url> [--group <name>] | subscription update <group> | "
+            "subscription remove <group> | subscription list\n"
+            "\n"
+            "import: accept vless:// vmess:// ss:// socks:// socks5:// links\n"
+            "subscription: fetch a remote subscription url, create a group, import all configs\n"
+            "\n"
+            "qr: generate QR code PNG for profile connection URI"
+        )
+        sys.exit(0)
+
+    # --group <name> / --group=<name> applies to import, list, connect
+    group = None
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--group":
+            if i + 1 >= len(argv):
+                die("--group requires a value")
+            group = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--group="):
+            group = a[len("--group="):]
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    argv = rest
+
+    cmd = argv[0] if argv else ""
+    arg = argv[1] if len(argv) > 1 else None
+    handlers = {
+        "import": lambda: cmd_import(arg, group=group),
+        "backend": lambda: cmd_backend(arg),
+        "list": lambda: cmd_list(arg, group=group),
+        "status": lambda: cmd_status(arg),
+        "connect": lambda: cmd_connect(arg, group=group),
+        "disconnect": lambda: cmd_disconnect(arg),
+        "mode": lambda: cmd_mode(arg),
+        "select": lambda: cmd_select(arg),
+        "remove": lambda: cmd_remove(arg),
+        "ping": lambda: cmd_ping(arg),
+        "qr": lambda: cmd_qr(arg),
+        # group needs the full remainder: set <id> <name> spans multiple args
+        "group": lambda: cmd_group(" ".join(argv[1:])),
+        "subscription": lambda: cmd_subscription(" ".join(argv[1:]), group=group),
+    }
+    fn = handlers.get(cmd)
+    if fn is None:
+        die("unknown command: %s" % cmd)
+    fn()
+
+
+if __name__ == "__main__":
+    main()
