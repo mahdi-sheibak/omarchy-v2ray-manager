@@ -1,8 +1,8 @@
 # v2ray-manager for Omarchy
 
-VLESS/VMESS proxy and TUN VPN manager for the Omarchy bar. Toggle proxy or full TUN mode, switch between sing-box and xray-core backends, manage profiles and subscriptions, import share links, and watch live traffic on a sparkline — all from one bar icon and popup panel.
+![V2Ray Manager preview](preview.png)
 
-![Plugin preview](preview.png)
+VLESS/VMESS proxy and TUN VPN manager for the Omarchy bar. Toggle proxy or full TUN mode, switch between sing-box and xray-core backends, manage profiles and subscriptions, import share links, and watch live traffic on a sparkline — all from one bar icon and popup panel.
 
 ![Omarchy](https://img.shields.io/badge/Omarchy-Quattro-blue) ![License](https://img.shields.io/badge/license-MIT-green)
 
