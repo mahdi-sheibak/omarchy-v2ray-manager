@@ -31,8 +31,13 @@ Item {
   // Auto-reconnect on consecutive health-check failures
   property bool autoReconnect: true
 
-  readonly property bool busy: whichProcess.running || statusProcess.running || actionProcess.running || pingProcess.running || healthCheckProcess.running || qrProcess.running || _queueRunning
-  readonly property string cli: "omarchy-v2ray"
+  readonly property bool busy: whichProcess.running || installerProcess.running || statusProcess.running || actionProcess.running || pingProcess.running || healthCheckProcess.running || qrProcess.running || _queueRunning
+  // Absolute CLI path — Quickshell's Process env may not carry ~/.local/bin
+  // on PATH, so `which` alone is unreliable. install.sh always lands here.
+  readonly property string cliPath: Quickshell.env("HOME") + "/.local/bin/omarchy-v2ray"
+  readonly property string cli: cliPath
+  // Plugin dir on disk (Service.qml sits in the plugin root).
+  readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
 
   // Read a single value from this widget's inline shell.json entry, with
   // a fallback for missing/null values.
@@ -102,8 +107,39 @@ Item {
   }
 
   Component.onCompleted: {
-    whichProcess.command = ["which", cli]
+    // Check for the CLI; if missing, self-install from the plugin folder.
+    whichProcess.command = ["which", "omarchy-v2ray"]
     whichProcess.running = true
+  }
+
+  // ── Self-install: when the CLI is missing, run scripts/install.sh once ──
+  property bool _installAttempted: false
+  function runInstaller() {
+    if (_installAttempted || installerProcess.running) return
+    _installAttempted = true
+    lastError = ""
+    actionStatus = "Installing CLI…"
+    installerProcess.command = ["bash", pluginDir + "/scripts/install.sh"]
+    installerProcess.running = true
+  }
+
+  Process {
+    id: installerProcess
+    running: false
+    command: []
+    stdout: StdioCollector { waitForEnd: true }
+    stderr: StdioCollector { id: installStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode === 0) {
+        // Re-detect the CLI now that install.sh placed it.
+        whichProcess.command = ["which", "omarchy-v2ray"]
+        whichProcess.running = true
+      } else {
+        actionStatus = ""
+        lastError = "Auto-install failed (exit " + exitCode + "): "
+          + String(installStderr.text || "").replace(/\x1b\[[0-9;]*m/g, "").trim()
+      }
+    }
   }
 
   // If refresh() is called while a status poll is already in flight, retry
@@ -391,7 +427,10 @@ Item {
     onExited: function(exitCode) {
       root.installed = exitCode === 0
       if (root.installed) root.refresh()
-      else root.lastError = "omarchy-v2ray CLI not found in PATH"
+      else {
+        root.installed = false
+        root.runInstaller()   // self-heal: install.sh deploys CLI, then recheck
+      }
     }
   }
 
