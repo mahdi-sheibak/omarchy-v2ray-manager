@@ -27,10 +27,12 @@ MODE="$(stat -c '%a' "$CFG_REAL")"
 [ $((8#$MODE & 8#022)) -eq 0 ] || { echo "config group/other-writable: $MODE" >&2; exit 1; }
 
 # Config must parse as JSON and declare a TUN inbound.
+# xray-core uses `protocol: tun`; sing-box uses `type: tun`.
 python3 - "$CFG_REAL" <<'PYEOF' || { echo "config rejected by validator" >&2; exit 1; }
 import json, sys
 cfg = json.load(open(sys.argv[1]))
-if not any(i.get("type") == "tun" for i in cfg.get("inbounds", [])):
+inbounds = cfg.get("inbounds", [])
+if not any(i.get("type") == "tun" or i.get("protocol") == "tun" for i in inbounds):
     sys.exit(1)
 PYEOF
 
