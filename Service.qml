@@ -34,7 +34,9 @@ Item {
   readonly property bool busy: whichProcess.running || installerProcess.running || statusProcess.running || actionProcess.running || pingProcess.running || healthCheckProcess.running || qrProcess.running || _queueRunning
   // Absolute CLI path — Quickshell's Process env may not carry ~/.local/bin
   // on PATH, so `which` alone is unreliable. install.sh always lands here.
-  readonly property string cliPath: Quickshell.env("HOME") + "/.local/bin/omarchy-v2ray"
+  // NOT readonly: applyCheckResult() imperatively re-binds it to the path
+  // resolved by `which` when the default location misses.
+  property string cliPath: Quickshell.env("HOME") + "/.local/bin/omarchy-v2ray"
   readonly property string cli: cliPath
   // Plugin dir on disk (Service.qml sits in the plugin root).
   readonly property string pluginDir: Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, "")
