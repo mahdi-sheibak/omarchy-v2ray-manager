@@ -1,10 +1,19 @@
 [Unit]
-Description=Omarchy V2Ray manager (xray-core TUN mode)
+Description=Omarchy V2Ray manager (xray-core TUN mode, user session)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/home/mahdi/.config/v2ray-manager/xray-tun-setup.sh
+# Runs as the invoking user — no root code execution. xray needs CAP_NET_ADMIN
+# for the TUN device; granted via ambient capabilities, bounded to those caps.
+User=%i
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
+NoNewPrivileges=yes
+# Root-owned, user-non-writable routing wrapper (installed by scripts/install.sh
+# via pkexec with ownership/mode verification).
+ExecStart=/usr/local/lib/omarchy-v2ray/xray-tun-wrapper %h/.config/v2ray-manager/config-xray-tun.json
 Restart=on-failure
 RestartSec=3
 
