@@ -70,7 +70,10 @@ if [ "$units_needed" = "1" ]; then
         for unit in $SYS_UNITS; do
             src="$PLUGIN_DIR/systemd/$unit"
             dst="/etc/systemd/system/$unit"
-            sed "s|%i|$PLUGIN_USER|g" "$src" > "$dst"
+            # %i → installing username; %h → installing user's home.
+            # (In a system unit %h expands to /root, so rewrite here.)
+            USER_HOME="$(getent passwd "$PLUGIN_USER" | cut -d: -f6)"
+            sed -e "s|%i|$PLUGIN_USER|g" -e "s|%h|$USER_HOME|g" "$src" > "$dst"
         done
         systemctl daemon-reload
     }
