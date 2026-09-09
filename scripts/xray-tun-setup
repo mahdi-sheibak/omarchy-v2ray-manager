@@ -5,6 +5,11 @@
 
 CFG=/home/mahdi/.config/v2ray-manager/config-xray-tun.json
 STATE=/run/omarchy-v2ray-tun-routes.txt
+# /run not writable by the unit's User= — use per-user runtime dir.
+# systemd creates /run/omarchy-v2ray (owned by User=) via RuntimeDirectory=.
+if [ ! -w /run ]; then
+    STATE="/run/omarchy-v2ray/tun-routes.txt"
+fi
 
 cleanup() {
     # Restore direct routing on exit — but only if we actually hijacked.

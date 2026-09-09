@@ -11,6 +11,8 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
 NoNewPrivileges=yes
+RuntimeDirectory=omarchy-v2ray
+RuntimeDirectoryMode=0700
 # Root-owned, user-non-writable routing wrapper (installed by scripts/install.sh
 # via pkexec with ownership/mode verification).
 ExecStart=/usr/local/lib/omarchy-v2ray/xray-tun-wrapper %h/.config/v2ray-manager/config-xray-tun.json
